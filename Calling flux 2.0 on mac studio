@@ -1,0 +1,81 @@
+# 파일명: flux_server.py
+# 위치: HP Omen의 Genesis_Factory 폴더 안
+
+import os
+import torch
+from fastapi import FastAPI
+from pydantic import BaseModel
+from diffusers import FluxPipeline
+
+# ==========================================
+# 1. 저장 경로 설정 (Windows 환경)
+# ==========================================
+# 현재 파일이 있는 폴더를 기준으로 '2_assets' 폴더를 찾습니다.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSET_DIR = os.path.join(BASE_DIR, "2_assets")
+
+# 폴더가 없으면 자동으로 만듭니다.
+os.makedirs(ASSET_DIR, exist_ok=True)
+
+# ==========================================
+# 2. Flux 2.0 모델 로드 (RTX 5090 파워 사용)
+# ==========================================
+print("🚀 [System] Flux 2.0 모델을 RTX 5090 메모리에 로드 중입니다... (잠시만 기다리세요)")
+
+# HuggingFace에서 Flux 모델을 다운로드 및 로드합니다.
+# 주의: 처음 실행 시 몇 GB 데이터를 다운로드하느라 시간이 걸립니다.
+pipe = FluxPipeline.from_pretrained(
+    "black-forest-labs/FLUX.1-dev",  # 혹은 "black-forest-labs/FLUX.1-schnell" (더 빠름)
+    torch_dtype=torch.bfloat16
+)
+
+# GPU 할당 (RTX 5090의 VRAM 활용 최적화)
+pipe.enable_model_cpu_offload() 
+# pipe.to("cuda") # 만약 위 코드로 느리다면 이 줄의 주석을 풀고 위를 주석 처리하세요.
+
+print("✅ [System] 모델 로드 완료! 그림 그릴 준비가 되었습니다.")
+
+# ==========================================
+# 3. 서버 설정 (Mac의 요청을 받는 곳)
+# ==========================================
+app = FastAPI()
+
+# 요청받을 데이터 형식 정의 (프롬프트와 파일명)
+class ImageRequest(BaseModel):
+    prompt: str
+    filename: str
+
+@app.post("/generate")
+def generate_image(request: ImageRequest):
+    print(f"\n📩 [Request Received] Mac에서 요청 도착!")
+    print(f" - 프롬프트: {request.prompt}")
+    print(f" - 파일명: {request.filename}")
+
+    # 저장될 전체 경로 만들기
+    save_path = os.path.join(ASSET_DIR, request.filename)
+
+    # 이미 같은 파일이 있으면 스킵 (시간 절약)
+    if os.path.exists(save_path):
+        print(f"⚠️ [Skip] 이미 파일이 존재합니다: {save_path}")
+        return {"status": "exists", "path": save_path}
+
+    # === Flux가 그림 그리는 핵심 구간 ===
+    print("🎨 [Flux] 그림 그리는 중...", end="")
+    
+    image = pipe(
+        request.prompt,
+        height=1024,
+        width=1024,
+        guidance_scale=3.5,
+        num_inference_steps=20, # 퀄리티가 낮으면 30~50으로 올리세요
+        max_sequence_length=512,
+        generator=torch.Generator("cpu").manual_seed(42) # 시드 고정 (일관성 유지용)
+    ).images[0]
+    
+    # 이미지 저장
+    image.save(save_path)
+    print(f" 완료! -> 저장됨: {save_path}")
+
+    return {"status": "success", "path": save_path}
+
+# 실행은 터미널에서: uvicorn flux_server:app --host 0.0.0.0 --port 8000
