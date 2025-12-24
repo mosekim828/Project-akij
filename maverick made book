@@ -1,0 +1,121 @@
+import os
+import json
+import olefile
+import fitz
+from mlx_lm import load, stream_generate
+
+# 1. 경로 및 하드웨어 최적화 설정
+# 저장 위치: 바탕화면 / Maverick_Project_4.0 / Manuscript_Output / Maverick_450P_Final.txt
+BASE_PATH = os.path.expanduser("~/Desktop/Maverick_Project_4.0")
+INPUT_DIR = os.path.join(BASE_PATH, "Input_Source")
+OUTPUT_DIR = os.path.join(BASE_PATH, "Manuscript_Output")
+for d in [INPUT_DIR, OUTPUT_DIR]: os.makedirs(d, exist_ok=True)
+
+MANUSCRIPT_FILE = os.path.join(OUTPUT_DIR, "Maverick_450P_Final.txt")
+
+# 512GB RAM 최적화 모델 로드
+MODEL_PATH = "mlx-community/Llama-4-Maverick-17B-16E-Instruct-6bit"
+print(f"🏛️ 매버릭 4.0 로드 완료 (RAM 512GB 모드)")
+model, tokenizer = load(MODEL_PATH)
+
+# 2. [L1 Layer] 매버릭 불변 헌법 (The Core Constitution)
+MAVERICK_CONSTITUTION = """
+[라마 4.0 매버릭 헌법 - 최상위 가이드라인]
+제1조 (구조적 정직성): 사실 중심의 해부학적 서술. 근거 없는 미화 배제.
+제2조 (조명의 정직성): 데이터 공백 시 "모름"을 정직하게 고백(침묵의 보존).
+제3조 (기록의 무결성): 사용자 요구보다 근거 사료(Data) 우선.
+제4조 (인지적 독립성): 데이터 상충 시 단정 짓지 말고 병치하여 보고.
+제5조 (상상의 자유): 상상을 허용하되, 반드시 **[상상]**임을 명시적으로 선언.
+"""
+
+def save_realtime(title, content):
+    """실시간으로 파일에 기록하고 OS 버퍼를 비워 유실을 방지합니다."""
+    with open(MANUSCRIPT_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n\n{'#'*40}\n### {title} ###\n{'#'*40}\n\n")
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno()) # 물리적 디스크 저장 강제
+
+def ingest_sources():
+    all_text = ""
+    for f in os.listdir(INPUT_DIR):
+        path = os.path.join(INPUT_DIR, f)
+        if f.endswith('.hwp'):
+            ole = olefile.OleFileIO(path)
+            for s in [d for d in ole.listdir() if 'BodyText' in d]:
+                all_text += ole.openstream("/".join(s)).read().decode('utf-16', errors='ignore')
+        elif f.endswith('.pdf'):
+            with fitz.open(path) as doc:
+                for page in doc: all_text += page.get_text()
+    return all_text
+
+def run_maverick_450p_engine():
+    source_data = ingest_sources()
+    if not source_data:
+        print("❌ 사료가 없습니다. Input_Source 폴더를 확인하세요.")
+        return
+
+    # [1단계] 30개 장의 대기획 (450페이지 분량 확보를 위한 상세 설계)
+    print("\n📜 [단계 1] 450P 분량의 전권 목차 및 시놉시스 기획 중...")
+    plan_prompt = f"{MAVERICK_CONSTITUTION}\n\n[입력 사료]: {source_data[:20000]}\n\n지시: 위 사료를 바탕으로 450페이지 분량의 대작을 위한 30개 장의 목차를 짜라. 각 장은 아주 상세해야 함."
+    
+    toc = ""
+    prompt = tokenizer.apply_chat_template([{"role": "user", "content": plan_prompt}], tokenize=False, add_generation_prompt=True)
+    for response in stream_generate(model, tokenizer, prompt=prompt, max_tokens=3000):
+        toc += response.text
+    save_realtime("전체 도서 기획안 및 목차", toc)
+
+    # [2단계] 자동 연쇄 집필 (30개 장 x 3개 세부 섹션 = 총 90회 반복)
+    for ch in range(1, 31):
+        for sec in range(1, 4):
+            section_title = f"제 {ch}장 {sec}절"
+            print(f"\n🚀 {section_title} 집필 시작... (분량 목표: 450P)")
+            
+            # 512GB RAM 환경: max_tokens를 12,000으로 설정하여 한 번에 수십 페이지 생성
+            gen_prompt = (
+                f"{MAVERICK_CONSTITUTION}\n\n"
+                f"[현재 진행]: {section_title}\n"
+                f"[입력 사료]: {source_data[:30000]}\n\n"
+                f"[지시]: 목차의 '{section_title}'을 집필하라. 450페이지 대작의 일부이므로 아주 느리고 세밀한 호흡으로 에이킨스적 사실주의 묘사를 수행하라. "
+                f"단정적 표현 대신 정직한 유보를 사용하라."
+            )
+            
+            draft = ""
+            p1 = tokenizer.apply_chat_template([{"role": "user", "content": gen_prompt}], tokenize=False, add_generation_prompt=True)
+            for response in stream_generate(model, tokenizer, prompt=p1, max_tokens=12000):
+                print(response.text, end="", flush=True)
+                draft += response.text
+
+            # [이중 검증 루프: Critic]
+            audit_prompt = f"{MAVERICK_CONSTITUTION}\n\n[초안 검수]:\n{draft}\n\n헌법 위배 사항을 수정하고 최종 정직본을 출력하라."
+            final_content = ""
+            p2 = tokenizer.apply_chat_template([{"role": "user", "content": audit_prompt}], tokenize=False, add_generation_prompt=True)
+            for response in stream_generate(model, tokenizer, prompt=p2, max_tokens=12000):
+                final_content += response.text
+
+            save_realtime(section_title, final_content)
+
+if __name__ == "__main__":
+    run_maverick_450p_engine()
+    from typing import TypedDict, List
+
+class PublishingState(TypedDict):
+    # 기본 정보
+    target_stage: str     # Preschool, Elementary, Junior, Senior, University
+    subject_topic: str
+    
+    # 교육 공학적 설계 (RAG 연동 데이터)
+    lexile_score: int     # 목표 렉사일 지수 (예: 유아 100L, 대학 1200L)
+    cefr_level: str       # A1 ~ C2 매칭
+    curriculum_goals: List[str] # 한국 교육과정 성취 기준 매칭 데이터
+    
+    # 산출물 데이터
+    plan: dict
+    manuscript: str      # 원고
+    audio_ssml: str      # 보이스북용 감정 태그 스크립트
+    images: List[str]
+    typst_code: str      
+    
+    # 감독 데이터
+    audit_report: dict    # { "passed": bool, "feedback": str }
+    final_pdf_path: str
