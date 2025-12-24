@@ -1,0 +1,183 @@
+import os
+import json
+import requests
+import re
+from typing import TypedDict, List, Optional
+from mlx_lm import load, generate
+
+# ==========================================
+# 1. 환경 설정 및 하드웨어 구성
+# ==========================================
+
+# [Network] HP Omen (Flux Server) 설정
+# 주의: PC의 실제 IP 주소로 변경하세요 (예: 192.168.0.5)
+OMEN_SERVER_URL = "http://192.168.0.10:8000/generate" 
+
+# [Local] 경로 설정
+BASE_PATH = os.path.expanduser("~/Desktop/Maverick_Project_4.0")
+OUTPUT_DIR = os.path.join(BASE_PATH, "Production_Output")
+ASSET_DIR = os.path.join(BASE_PATH, "Assets") # 이미지가 저장될 곳
+for d in [OUTPUT_DIR, ASSET_DIR]: os.makedirs(d, exist_ok=True)
+
+# [Model] 매버릭 모델 로드 (Mac Studio 512GB 최적화)
+MODEL_PATH = "mlx-community/Llama-4-Maverick-17B-16E-Instruct-6bit" 
+print(f"🏛️ [System] 매버릭 4.0 & Flux 연동 엔진 가동 중...")
+model, tokenizer = load(MODEL_PATH)
+
+# ==========================================
+# 2. 데이터 구조 및 헌법 정의
+# ==========================================
+
+MAVERICK_CONSTITUTION = """
+[라마 4.0 매버릭 헌법 - 최상위 가이드라인]
+제1조 (구조적 정직성): 사실 중심의 해부학적 서술. 근거 없는 미화 배제.
+제2조 (조명의 정직성): 데이터 공백 시 "모름"을 정직하게 고백(침묵의 보존).
+제3조 (기록의 무결성): 사용자 요구보다 근거 사료(Data) 우선.
+제4조 (상상의 자유): 상상을 허용하되, 반드시 **[상상]** 태그를 명시.
+제5조 (매체 통합성): 글을 쓸 때, 해당 장면을 가장 잘 묘사하는 '이미지 프롬프트'를 반드시 함께 고안할 것.
+"""
+
+# 대표님이 정의하신 상태 관리 구조 (State)
+class PublishingState(TypedDict):
+    target_stage: str     # Preschool, Elementary, etc.
+    subject_topic: str    # 주제
+    manuscript: str       # 생성된 원고
+    image_prompts: List[str] # Flux에게 보낼 프롬프트
+    image_paths: List[str]   # 생성된 이미지 파일 경로
+
+# ==========================================
+# 3. 핵심 기능 함수 (The Engines)
+# ==========================================
+
+def call_flux_on_omen(prompt: str, filename: str) -> Optional[str]:
+    """
+    Mac -> PC(HP Omen)으로 이미지 생성을 요청하는 함수
+    """
+    print(f"🎨 [Flux Request] Omen에게 요청 중: {filename}...")
+    
+    payload = {
+        "prompt": prompt,
+        "filename": filename
+    }
+    
+    try:
+        response = requests.post(OMEN_SERVER_URL, json=payload, timeout=300) # 5분 대기
+        if response.status_code == 200:
+            result = response.json()
+            # PC가 저장한 경로를 반환하지만, Mac에서는 공유 폴더 경로로 접근한다고 가정
+            # 여기서는 편의상 파일명만 리턴하여 Mac의 ASSET_DIR과 매칭
+            print(f"✅ [Flux Success] 이미지 생성 완료: {filename}")
+            return os.path.join(ASSET_DIR, filename)
+        else:
+            print(f"❌ [Flux Error] 서버 응답 오류: {response.text}")
+            return None
+    except requests.exceptions.ConnectionError:
+        print(f"❌ [Connection Error] HP Omen이 켜져 있나요? IP({OMEN_SERVER_URL})를 확인하세요.")
+        return None
+
+def generate_content_block(state: PublishingState):
+    """
+    매버릭(Llama)이 헌법에 따라 글을 쓰고, 동시에 그림 프롬프트를 뽑아냅니다.
+    """
+    
+    # 1. 프롬프트 엔지니어링 (JSON 출력을 강제하여 파싱 용이성 확보)
+    system_prompt = f"""
+    {MAVERICK_CONSTITUTION}
+    
+    너는 위 헌법을 준수하는 출판 에이전트다.
+    사용자의 요청에 맞춰 **이야기(Story)**와 **삽화 지시문(Image Prompt)**을 생성하라.
+    
+    반드시 아래 JSON 포맷으로만 응답하라. 다른 말은 하지 마라.
+    {{
+        "story_text": "여기에 헌법을 준수한 이야기 본문 작성...",
+        "flux_prompt": "여기에 Flux 2.0을 위한 영문 이미지 프롬프트 작성 (묘사 위주)..."
+    }}
+    """
+    
+    user_request = f"""
+    대상 독자: {state['target_stage']}
+    주제: {state['subject_topic']}
+    
+    위 주제로 한 페이지 분량의 내용을 작성하고, 핵심 장면을 묘사하는 프롬프트를 만드시오.
+    """
+    
+    # 2. 텍스트 생성 (Mac Studio)
+    print(f"⚡️ [Maverick] 집필 시작 ({state['subject_topic']})...")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_request}
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    response = generate(model, tokenizer, prompt=prompt, max_tokens=2000, verbose=False)
+    
+    # 3. 결과 파싱 (JSON 추출)
+    try:
+        # 가끔 LLM이 JSON 앞뒤로 잡담을 넣을 수 있어 정제
+        json_str = response.strip()
+        if "```json" in json_str:
+            json_str = json_str.split("```json")[1].split("```")[0]
+        
+        data = json.loads(json_str)
+        
+        state['manuscript'] = data['story_text']
+        state['image_prompts'].append(data['flux_prompt'])
+        
+        print(f"📝 [Text Done] 원고 생성 완료.")
+        return state
+        
+    except json.JSONDecodeError:
+        print("⚠️ [Parsing Error] 매버릭이 JSON 형식을 어겼습니다. Raw Output을 저장합니다.")
+        state['manuscript'] = response
+        return state
+
+# ==========================================
+# 4. 메인 파이프라인 (Execution Loop)
+# ==========================================
+
+def run_production_line():
+    # 1. 기획 단계 (입력값 설정)
+    current_state: PublishingState = {
+        "target_stage": "Elementary School (Age 10)",
+        "subject_topic": "A Cat Astronaut exploring Mars (고양이 우주비행사의 화성 탐사)",
+        "lexile_score": 500,
+        "cefr_level": "A2",
+        "curriculum_goals": ["Space Vocabulary", "Past Tense"],
+        "plan": {},
+        "manuscript": "",
+        "audio_ssml": "",
+        "images": [],
+        "image_prompts": [],
+        "image_paths": [], # 생성된 이미지 경로 저장
+        "typst_code": "",
+        "audit_report": {},
+        "final_pdf_path": ""
+    }
+
+    # 2. 매버릭 집필 (Mac)
+    current_state = generate_content_block(current_state)
+    
+    # 3. Flux 이미지 생성 (HP Omen 연결)
+    if current_state['image_prompts']:
+        prompt = current_state['image_prompts'][0]
+        # 파일명 자동 생성 (topic_001.png)
+        safe_name = current_state['subject_topic'].replace(" ", "_")[:10]
+        filename = f"{safe_name}_001.png"
+        
+        # HP Omen 호출!
+        img_path = call_flux_on_omen(prompt, filename)
+        
+        if img_path:
+            current_state['image_paths'].append(img_path)
+            
+    # 4. 결과 저장 (JSON 로그)
+    log_path = os.path.join(OUTPUT_DIR, "production_log.json")
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(current_state, f, ensure_ascii=False, indent=4)
+        
+    print(f"\n🎉 [Process Complete] 모든 작업 완료.")
+    print(f" - 원고 내용: {current_state['manuscript'][:50]}...")
+    print(f" - 이미지 경로: {current_state['image_paths']}")
+
+if __name__ == "__main__":
+    run_production_line()
