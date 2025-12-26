@@ -1,0 +1,406 @@
+"""
+PROJECT: AKI J (Autonomous Knowledge Integration & Journalism)
+VERSION: 10.1 SYNTAX SAFE EDITION
+PLATFORM: Mac Studio (Apple Silicon / MLX)
+AUTHOR: Maverick AI System
+
+[FIX REPORT]
+- Fixed SyntaxError: Expanded all one-liner 'try-with' blocks to standard multi-line format.
+- Consistency: 'SystemManager' and 'AssetManager' naming unified to 'AkiJ_System'.
+- Safety: Added explicit encoding='utf-8' to all file operations.
+"""
+
+import os
+# [CRITICAL] 토크나이저 병렬 처리 경고 끄기
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import sys
+import re
+import glob
+import time
+import json
+import shutil
+import logging
+import datetime
+import subprocess
+import traceback
+import urllib.request
+from typing import List, Dict, Tuple
+from tqdm import tqdm
+from colorama import Fore, Style, init
+
+# --- 라이브러리 검증 ---
+try:
+    import mlx_whisper
+    from mlx_lm import load, generate
+    from pypdf import PdfReader
+except ImportError as e:
+    print(f"❌ [Critical Error] 필수 라이브러리 누락: {e}")
+    sys.exit(1)
+
+init(autoreset=True)
+
+# ==============================================================================
+# [1] CONFIGURATION
+# ==============================================================================
+class Config:
+    # 📌 모델 경로
+    MODEL_PATH = "/Users/juson/.cache/huggingface/hub/models--mlx-community--Llama-4-Maverick-17B-16E-Instruct-6bit/snapshots/542ea389fcd614c665c4306bd60ad053d9da8d03"
+    WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"
+    
+    # 📌 디렉토리
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DIR_INPUTS = os.path.join(BASE_DIR, "inputs")
+    DIR_MATERIALS = os.path.join(BASE_DIR, "materials")
+    DIR_OUTPUT = os.path.join(BASE_DIR, "outputs")
+    DIR_PROCESSED = os.path.join(BASE_DIR, "processed")
+    DIR_LOGS = os.path.join(BASE_DIR, "logs")
+    DIR_FONTS = os.path.join(BASE_DIR, "assets", "fonts")
+    
+    # 📌 파라미터
+    DAEMON_SLEEP = 3
+    MAX_RETRIES = 3
+    CONTEXT_LIMIT = 12000
+    
+    # 📌 폰트 리스트
+    FONTS = {
+        "NotoSansKR-Bold.otf": "https://github.com/google/fonts/raw/main/ofl/notosanskr/NotoSansKR-Bold.otf",
+        "NotoSansKR-Regular.otf": "https://github.com/google/fonts/raw/main/ofl/notosanskr/NotoSansKR-Regular.otf",
+        "NotoSerifKR-Bold.otf": "https://github.com/google/fonts/raw/main/ofl/notoserifkr/NotoSerifKR-Bold.otf",
+        "NotoSerifKR-Regular.otf": "https://github.com/google/fonts/raw/main/ofl/notoserifkr/NotoSerifKR-Regular.otf",
+        "Montserrat-Bold.ttf": "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Bold.ttf",
+        "Roboto-Regular.ttf": "https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Regular.ttf"
+    }
+
+# ==============================================================================
+# [2] LOGGING
+# ==============================================================================
+for d in [Config.DIR_INPUTS, Config.DIR_MATERIALS, Config.DIR_OUTPUT, Config.DIR_PROCESSED, Config.DIR_LOGS, Config.DIR_FONTS]:
+    os.makedirs(d, exist_ok=True)
+
+logger = logging.getLogger("AkiJ")
+logger.setLevel(logging.INFO)
+if logger.hasHandlers():
+    logger.handlers.clear()
+    
+fh = logging.FileHandler(os.path.join(Config.DIR_LOGS, "akij_system.log"), encoding='utf-8')
+fh.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+logger.addHandler(fh)
+
+def log(msg: str, color: str = Fore.WHITE, level: str = "info"):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"{Fore.LIGHTBLACK_EX}[{ts}] {color}{msg}{Style.RESET_ALL}")
+    
+    clean_msg = re.sub(r'\x1b\[[0-9;]*m', '', msg)
+    if level == "info": logger.info(clean_msg)
+    elif level == "error": logger.error(clean_msg)
+
+def clean_json(text: str) -> Dict:
+    try:
+        text = re.sub(r"```json", "", text).replace("```", "").strip()
+        s = text.find('{')
+        e = text.rfind('}') + 1
+        if s != -1:
+            return json.loads(text[s:e])
+        return {}
+    except:
+        return {}
+
+# ==============================================================================
+# [3] SYSTEM MANAGER
+# ==============================================================================
+class AkiJ_System:
+    @staticmethod
+    def initialize():
+        log("🛠️ [System] 시스템 무결성 검사 중...", Fore.CYAN)
+        AkiJ_System._check_typst()
+        AkiJ_System._sync_fonts()
+        log("✅ [System] 모든 준비가 완료되었습니다.", Fore.GREEN)
+
+    @staticmethod
+    def _check_typst():
+        try:
+            subprocess.run(["typst", "--version"], capture_output=True, check=True)
+        except:
+            log("❌ [Error] Typst가 설치되지 않았습니다.", Fore.RED, "error")
+            sys.exit(1)
+
+    @staticmethod
+    def _sync_fonts():
+        missing = [n for n in Config.FONTS if not os.path.exists(os.path.join(Config.DIR_FONTS, n))]
+        if missing:
+            log(f"📥 [Assets] 폰트 다운로드 중 ({len(missing)}개)...", Fore.YELLOW)
+            for name in missing:
+                try:
+                    url = Config.FONTS[name]
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    save_path = os.path.join(Config.DIR_FONTS, name)
+                    with urllib.request.urlopen(req) as r, open(save_path, 'wb') as f:
+                        shutil.copyfileobj(r, f)
+                    log(f"   ✅ 설치: {name}", Fore.GREEN)
+                except Exception as e:
+                    log(f"   ⚠️ 실패({name}): {e}", Fore.RED)
+
+# ==============================================================================
+# [4] OMNI-BRAIN
+# ==============================================================================
+class OmniBrain:
+    def __init__(self):
+        log("🧠 [Brain] Llama-4 로딩 중...", Fore.MAGENTA)
+        if not os.path.exists(Config.MODEL_PATH):
+            log(f"❌ 경로 오류: {Config.MODEL_PATH}", Fore.RED)
+            sys.exit(1)
+        
+        try:
+            self.llm, self.tok = load(Config.MODEL_PATH)
+            self.whisper = Config.WHISPER_MODEL
+        except Exception as e:
+            log(f"❌ 모델 로드 실패: {e}", Fore.RED)
+            sys.exit(1)
+        
+        log("✅ [Brain] 신경망 활성화.", Fore.GREEN)
+
+    def think(self, role, task, context="") -> str:
+        prompt = f"System: You are Aki J.\nRole: {role}\nContext: {context[:Config.CONTEXT_LIMIT]}\nUser: {task}\nAssistant:"
+        
+        for i in range(Config.MAX_RETRIES):
+            try:
+                # temperature 인자 제거 (MLX 호환성)
+                res = generate(self.llm, self.tok, prompt=prompt, max_tokens=6000, verbose=False)
+                if res.strip():
+                    return res
+            except Exception as e:
+                log(f"⚠️ 생각 중 오류({i+1}): {e}", Fore.YELLOW)
+                time.sleep(1)
+        return ""
+
+    def hear(self, path) -> str:
+        log(f"   👂 [Hearing] 분석 중: {os.path.basename(path)}", Fore.CYAN)
+        try:
+            return mlx_whisper.transcribe(path, path_or_hf_repo=self.whisper)['text']
+        except:
+            return ""
+
+# ==============================================================================
+# [5] SENSES (이부분이 수정되었습니다)
+# ==============================================================================
+class Senses:
+    def __init__(self, brain):
+        self.brain = brain
+
+    def scan(self) -> Tuple[List[str], str, str]:
+        files = [f for f in glob.glob(os.path.join(Config.DIR_INPUTS, "*")) if not os.path.basename(f).startswith('.')]
+        if not files:
+            return [], "", ""
+
+        log(f"👀 [Senses] {len(files)}개 파일 감지.", Fore.CYAN)
+        media, content, cmd = [], [], ""
+
+        for f in tqdm(files, desc="Ingesting", leave=False):
+            fname = os.path.basename(f)
+            try:
+                if fname.lower() == "command.txt":
+                    with open(f, 'r', encoding='utf-8') as fp:
+                        cmd = fp.read().strip()
+                    log(f"   📜 지령: {cmd[:30]}...", Fore.GREEN)
+                    media.append(f)
+                    continue
+                
+                txt = ""
+                ext = os.path.splitext(f)[1].lower()
+                
+                if ext in ['.mp3', '.wav', '.m4a', '.mp4', '.mov', '.mkv']:
+                    txt = self.brain.hear(f)
+                elif ext == '.pdf':
+                    reader = PdfReader(f)
+                    txt = "".join([p.extract_text() for p in reader.pages if p.extract_text()])
+                elif ext in ['.txt', '.md']:
+                    with open(f, 'r', encoding='utf-8') as fp:
+                        txt = fp.read()
+                
+                if txt:
+                    content.append(f"\n[SRC: {fname}]\n{txt}\n")
+                    media.append(f)
+            except Exception as e:
+                log(f"❌ 읽기 실패: {e}", Fore.RED)
+        
+        return media, "\n".join(content), cmd
+
+    def load_kb(self) -> str:
+        # 여기가 이전에 오류가 났던 부분입니다. try-with를 분리했습니다.
+        buf = ""
+        for f in glob.glob(os.path.join(Config.DIR_MATERIALS, "*")):
+            if os.path.basename(f).startswith('.'):
+                continue
+            try:
+                with open(f, 'r', encoding='utf-8') as fp:
+                    buf += f"\n[REF]\n{fp.read()}\n"
+            except Exception:
+                pass 
+        return buf
+
+# ==============================================================================
+# [6] SYNTAX SANITIZER
+# ==============================================================================
+class SyntaxSanitizer:
+    @staticmethod
+    def clean(text: str) -> str:
+        if not text: return ""
+        
+        # 헤더 변환
+        text = re.sub(r'^###\s+(.+)$', r'=== \1', text, flags=re.MULTILINE)
+        text = re.sub(r'^##\s+(.+)$', r'== \1', text, flags=re.MULTILINE)
+        text = re.sub(r'^#\s+(.+)$', r'= \1', text, flags=re.MULTILINE)
+        
+        # 본문 내 샵(#) 처리
+        lines = text.split('\n')
+        new_lines = []
+        for line in lines:
+            if line.strip().startswith('='):
+                new_lines.append(line)
+            else:
+                new_lines.append(line.replace('#', 'No.'))
+        text = "\n".join(new_lines)
+        
+        # 스타일 변환
+        text = text.replace('**', '*')
+        text = re.sub(r'^\s*[\*\-]\s+', '- ', text, flags=re.MULTILINE)
+        return text
+
+# ==============================================================================
+# [7] AGENTS
+# ==============================================================================
+class Agents:
+    def __init__(self, brain):
+        self.brain = brain
+
+    def plan(self, topic, ctx, cmd):
+        log(f"🤔 [Planner] 기획: {topic}", Fore.BLUE)
+        task = f"Plan book. Topic: {topic}. {cmd}. JSON Output: {{'title':'T','subtitle':'S','chapters':[{{'num':1,'title':'C','directive':'D'}}]}}"
+        res = self.brain.think("Chief Editor", task, ctx)
+        data = clean_json(res)
+        if not data:
+            return {"title": topic, "subtitle": "Report", "chapters": [{"num":1,"title":"Summary","directive":"Summarize."}]}
+        log(f"   📋 확정: <{data['title']}>", Fore.BLUE)
+        return data
+
+    def design(self, plan):
+        log("🎨 [Designer] 디자인...", Fore.MAGENTA)
+        res = self.brain.think("Art Director", f"Design '{plan['title']}'. JSON: {{'kr_font':'Noto Sans KR' or 'Noto Serif KR', 'theme_color':'#Hex'}}")
+        style = clean_json(res)
+        if "kr_font" not in style:
+            style = {"kr_font": "Noto Serif KR", "theme_color": "#333333"}
+        return style
+
+    def write(self, title, ch, ctx, tone):
+        log(f"   ✍️ [Writer] 집필: {ch['title']}", Fore.BLUE)
+        task = f"Write chapter '{ch['title']}' for '{title}'. Guide: {ch['directive']}. Tone: {tone}. Use Markdown."
+        return self.brain.think("Lead Author", task, ctx)
+
+    def edit(self, text):
+        return self.brain.think("Senior Editor", f"Refine text:\n{text[:5000]}")
+
+    def publish(self, plan, contents, style, fname):
+        log("🖨️ [Publisher] Typst 조판...", Fore.GREEN)
+        
+        kf_title = '"Noto Sans KR", "Montserrat"'
+        kf_body = f'"{style["kr_font"]}", "Roboto"'
+        acc = style.get("theme_color", "#000000")
+        
+        code = f"""
+        #set page(paper: "a4", margin: 2.5cm, fill: rgb("ffffff"))
+        #let accent = rgb("{acc}")
+        #set text(font: ({kf_body}), size: 10.5pt, lang: "ko")
+        #set par(justify: true, leading: 0.8em, first-line-indent: 1em)
+        
+        #show heading.where(level: 1): it => {{ pagebreak(weak: true); v(4em); align(right)[#text(font: ({kf_title}), size: 30pt, weight: "black", fill: accent)[#it.body]]; v(2em); line(length: 100%, stroke: 2pt + accent); v(4em) }}
+        #show heading.where(level: 2): it => {{ v(2em); text(font: ({kf_title}), size: 18pt, weight: "bold", fill: accent)[#it.body]; v(0.8em) }}
+        
+        #align(center+horizon)[ #rect(width: 90%, height: 90%, stroke: none)[ #v(2fr); #line(length: 40%, stroke: 6pt + accent); #v(1em); #text(font: ({kf_title}), size: 42pt, weight: "black")[{plan['title']}]; #v(1.5em); #text(font: ({kf_title}), size: 20pt, style: "italic", fill: gray)[{plan.get('subtitle', '')}]; #v(3fr); #text(font: ({kf_title}), size: 12pt, weight: "bold", fill: accent)[AKI J SERIES] ] ]
+        
+        #pagebreak(); #outline(title: text(font: ({kf_title}), size: 20pt, weight: "bold")[목 차], indent: auto, depth: 2)
+        """
+        
+        for c in contents:
+            typst_content = SyntaxSanitizer.clean(c['content'])
+            clean_title = c['title'].replace('"', '\\"')
+            code += f"\n\n= {clean_title}\n\n{typst_content}\n"
+            
+        tpath = os.path.join(Config.DIR_OUTPUT, f"{fname}.typ")
+        with open(tpath, "w") as f:
+            f.write(code)
+        
+        cmd = ["typst", "compile", tpath, "--font-path", Config.DIR_FONTS]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if res.returncode == 0:
+            log(f"🎉 [Success] {fname}.pdf", Fore.GREEN)
+            try:
+                subprocess.run(["open", os.path.join(Config.DIR_OUTPUT, f"{fname}.pdf")])
+            except:
+                pass
+        else:
+            log(f"💥 [Error] 컴파일 실패:\n{res.stderr}", Fore.RED)
+
+# ==============================================================================
+# [8] DAEMON
+# ==============================================================================
+def run_akij_daemon():
+    print("\n" + "="*70)
+    print(Fore.YELLOW + "      AKI J : SYNTAX SAFE EDITION (VER 10.1)")
+    print(Fore.CYAN + f"      📂 MONITORING: {Config.DIR_INPUTS}")
+    print("="*70 + "\n")
+
+    AkiJ_System.initialize()
+    brain = OmniBrain()
+    senses = Senses(brain)
+    agents = Agents(brain)
+    
+    log("🏭 [Aki J] 데몬 가동. 감시 중...", Fore.YELLOW)
+
+    while True:
+        try:
+            files, ctx, cmd = senses.scan()
+            if not files:
+                time.sleep(Config.DAEMON_SLEEP)
+                continue
+
+            log("\n🔔 작업 시작.", Fore.GREEN)
+            full_ctx = ctx + "\n" + senses.load_kb()
+            topic = "User Command" if cmd else f"Analysis ({datetime.datetime.now().strftime('%H:%M')})"
+            
+            plan = agents.plan(topic, full_ctx, cmd)
+            style = agents.design(plan)
+            
+            contents = []
+            for ch in plan['chapters']:
+                draft = agents.write(plan['title'], ch, full_ctx, "Professional")
+                polished = agents.edit(draft)
+                contents.append({"title": ch['title'], "content": polished})
+            
+            sid = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_t = re.sub(r'[^\w\s-]', '', plan['title']).strip().replace(' ', '_')[:30]
+            fname = f"AkiJ_{sid}_{safe_t}"
+            
+            agents.publish(plan, contents, style, fname)
+            
+            arch = os.path.join(Config.DIR_PROCESSED, sid)
+            os.makedirs(arch, exist_ok=True)
+            for f in files:
+                try:
+                    shutil.move(f, os.path.join(arch, os.path.basename(f)))
+                except:
+                    pass
+            
+            log("✅ 완료. 대기.\n", Fore.GREEN)
+
+        except KeyboardInterrupt:
+            log("\n🛑 종료.", Fore.RED)
+            sys.exit(0)
+        except Exception as e:
+            log(f"\n💥 오류: {e}", Fore.RED)
+            traceback.print_exc()
+            time.sleep(5)
+
+if __name__ == "__main__":
+    run_akij_daemon()
