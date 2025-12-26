@@ -1,0 +1,212 @@
+import subprocess
+import re
+import os
+import json
+import datetime
+from mlx_lm import load, generate
+
+# ==========================================
+# [설정] 모델 경로 및 파일 설정
+# ==========================================
+# 사용자님의 Mac Studio 내 모델 경로
+MODEL_PATH = "/Users/juson/.cache/huggingface/hub/models--mlx-community--Llama-4-Maverick-17B-16E-Instruct-6bit/snapshots/542ea389fcd614c665c4306bd60ad053d9da8d03" 
+MEMORY_FILE = "maverick_memory.json"
+OUTPUT_FILE = "maverick_output.typ"
+
+print(f"⏳ [System] 매버릭(Typst Specialist)을 로드합니다... ({MODEL_PATH})")
+try:
+    model, tokenizer = load(MODEL_PATH)
+    print("✅ [System] 로드 완료. 매버릭이 대기 중입니다.")
+except Exception as e:
+    print(f"❌ [Error] 모델 로드 실패: {e}")
+    exit()
+
+# ==========================================
+# 1. 기억 시스템 (Memory System)
+# ==========================================
+class MaverickMemory:
+    def __init__(self, filename):
+        self.filename = filename
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return {"lessons": [], "successful_snippets": []}
+
+    def save(self):
+        with open(self.filename, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def add_lesson(self, error_summary, fix_note):
+        """실패 후 성공했을 때 교훈 저장"""
+        entry = {
+            "date": str(datetime.datetime.now())[:19],
+            "error": error_summary,
+            "fix": fix_note
+        }
+        self.data["lessons"].append(entry)
+        self.save()
+
+    def get_knowledge(self):
+        """과거의 교훈을 프롬프트에 주입하기 위해 불러옴"""
+        if not self.data["lessons"]:
+            return "아직 기록된 실패/성공 데이터가 없습니다."
+        # 최근 3개의 교훈만 가져옴 (컨텍스트 절약)
+        recent_lessons = self.data["lessons"][-3:]
+        return "\n".join([f"- 주의사항: {l['error']} -> 해결책: {l['fix']}" for l in recent_lessons])
+
+memory = MaverickMemory(MEMORY_FILE)
+
+# ==========================================
+# 2. 매버릭의 두뇌 (Generation)
+# ==========================================
+def ask_maverick(mission, error_log="", memory_context=""):
+    """
+    매버릭에게 코드를 요청합니다. (기억 + 현재상황 + 에러로그 통합)
+    """
+    
+    # 시스템 프롬프트: Typst 전문가로서의 정체성 강화
+    system_msg = f"""
+    You are Maverick, a world-class Typst typesetter and developer.
+    
+    [YOUR MEMORY & RULES]:
+    {memory_context}
+    
+    1. Output ONLY valid Typst code inside ```typst ... ``` blocks.
+    2. Do NOT use LaTeX syntax (like \\begin or \\section). Use Typst syntax (#set, =, ==).
+    3. If an error log is provided, analyze it and FIX the code specifically.
+    """
+    
+    if error_log:
+        user_msg = f"""
+        [MISSION]: {mission}
+        
+        [PREVIOUS ERROR LOG]:
+        {error_log}
+        
+        [INSTRUCTION]:
+        The previous code failed to compile. Read the error log above carefully.
+        Fix the error and provide the complete corrected code.
+        """
+    else:
+        user_msg = f"[MISSION]: {mission}\n\nWrite the complete Typst code."
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg}
+    ]
+    
+    # 템플릿 적용
+    try:
+        prompt_formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except:
+        prompt_formatted = f"System: {system_msg}\nUser: {user_msg}\nAssistant:"
+
+    print("🧠 [Maverick] 코드를 설계하는 중...")
+    
+    # MLX 생성 (옵션 최소화로 오류 방지)
+    response = generate(
+        model, 
+        tokenizer, 
+        prompt=prompt_formatted, 
+        max_tokens=2500,  # 코드가 길어질 수 있으므로 넉넉하게
+        verbose=False     
+    )
+    
+    return response
+
+# ==========================================
+# 3. 실행 및 검증 (Execution)
+# ==========================================
+def extract_code(text):
+    match = re.search(r"```typst(.*?)```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    if "#set" in text or "#show" in text: # 백업: 코드블록 없어도 코드 같으면 추출
+        return text.strip()
+    return ""
+
+def compile_typst(filename):
+    try:
+        result = subprocess.run(
+            ["typst", "compile", filename],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return True, "Compilation Success"
+        else:
+            return False, result.stderr.strip()
+    except FileNotFoundError:
+        return False, "Typst command not found. Install it via 'brew install typst'"
+
+# ==========================================
+# 4. 메인 에이전트 루프 (Training Loop)
+# ==========================================
+def training_session(mission_description):
+    print(f"\n🎯 [New Mission] {mission_description}")
+    
+    # 기억 로드
+    current_knowledge = memory.get_knowledge()
+    print(f"📂 [Memory] 매버릭의 지식을 불러옵니다.")
+    
+    error_log = ""
+    
+    # 최대 5번의 수정 기회 (자가 치유)
+    for attempt in range(1, 6):
+        print(f"\n--- [Attempt {attempt}/5] ---")
+        
+        # 1. 생각 (Think)
+        response = ask_maverick(mission_description, error_log, current_knowledge)
+        
+        # 2. 행동 (Act - Code Writing)
+        code = extract_code(response)
+        if not code:
+            print("⚠️ 코드를 생성하지 못했습니다. 다시 시도합니다.")
+            error_log = "Error: No code block found inside ```typst ... ```. Please provide code."
+            continue
+            
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write(code)
+        print("📄 코드를 작성했습니다.")
+        
+        # 3. 검증 (Check)
+        success, msg = compile_typst(OUTPUT_FILE)
+        
+        if success:
+            print(f"🎉 [성공!] PDF가 생성되었습니다: {OUTPUT_FILE.replace('.typ', '.pdf')}")
+            
+            # 실패를 딛고 성공했다면, 교훈 저장 (학습)
+            if attempt > 1:
+                print("📝 [학습] 오류 수정 경험을 '장기 기억(JSON)'에 저장합니다.")
+                memory.add_lesson(
+                    error_summary=error_log[:100] + "...", # 로그 요약
+                    fix_note="Self-corrected based on compiler feedback."
+                )
+            
+            # Mac에서 PDF 자동 열기
+            subprocess.run(["open", OUTPUT_FILE.replace('.typ', '.pdf')])
+            return True
+            
+        else:
+            print(f"💥 [실패] 컴파일 에러 발생:\n{msg}")
+            # 에러 로그를 다음 턴의 컨텍스트로 넘김
+            error_log = msg 
+            
+    print("💀 [Mission Failed] 5번의 시도 끝에 해결하지 못했습니다.")
+    return False
+
+# ==========================================
+# 실행부
+# ==========================================
+if __name__ == "__main__":
+    # ▼▼▼ 여기에 원하는 Typst 미션을 적어주세요 ▼▼▼
+    mission = """
+    A4 사이즈 페이지를 설정해줘.
+    상단에는 'Maverick's Learning Log'라는 헤더를 넣고,
+    본문은 2단(columns: 2)으로 나누어줘.
+    내용은 'Lorem Ipsum'을 5문단 정도 채워서 레이아웃을 보여줘.
+    """
+    
+    training_session(mission)
