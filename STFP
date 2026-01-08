@@ -1,0 +1,813 @@
+import os
+import time
+import json
+import re
+import subprocess
+import glob
+import shutil
+import random
+import requests
+from datetime import datetime
+from collections import Counter
+from typing import List, Dict, TypedDict, Any, Tuple, Union
+from mlx_lm import load, generate
+
+# ==============================================================================
+# [라이브러리 로드] RAG (검색 증강 생성) 관련 모듈
+# ==============================================================================
+try:
+    from langchain_community.vectorstores import Chroma
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+except ImportError:
+    print("⚠️ [System] LangChain 라이브러리가 없습니다. 'pip install langchain-community chromadb' 필요.")
+
+import fitz  # PyMuPDF (PDF 처리용)
+
+# ==============================================================================
+# [0] 핵심 설정 (USER CONFIGURATION)
+# ==============================================================================
+
+# 1. PC 화가 서버 설정 (IP 주소 확인 필수)
+# Omen PC의 IP가 65번이 맞는지 확인하세요.
+PC_FLUX_SERVER_URL = "http://192.168.0.65:8000/draw"
+
+# 2. 기본 삽화 빈도 (몇 문단마다 그림을 그릴지)
+DEFAULT_ILLUSTRATION_FREQ = 3 
+
+# 3. 경로 설정 (사용자 환경에 맞춰 절대 경로 사용)
+USER_HOME = "/Users/juson"
+MODEL_PATH = f"{USER_HOME}/.cache/huggingface/hub/models--mlx-community--Llama-4-Maverick-17B-16E-Instruct-6bit/snapshots/542ea389fcd614c665c4306bd60ad053d9da8d03"
+
+# 공장 폴더 (Factory Input)
+FACTORY_DIR = f"{USER_HOME}/Desktop/factory_input"
+DIR_RESULT = os.path.join(FACTORY_DIR, "1_Result")
+DIR_REFERENCE = os.path.join(FACTORY_DIR, "2_Reference_Style")
+
+# 제네시스 프로젝트 폴더
+GENESIS_PATH = f"{USER_HOME}/Desktop/Genesis_Project"
+DIR_TEMPLATE = os.path.join(GENESIS_PATH, "D0_template")
+DIR_FONTS = os.path.join(GENESIS_PATH, "D5_Fonts")
+
+# ★ Vector DB 경로 & 임베딩 모델 (지식 검색용)
+DB_PERSIST_DIR = f"{USER_HOME}/Desktop/Genesis_Project/99_VectorDB"
+EMBEDDING_MODEL_ID = "BAAI/bge-m3"
+
+# 4. 폰트 설정 (기본값)
+# ★ [V30 수정] Typst 호환성을 위해 정확한 Family Name 사용 (띄어쓰기 포함)
+DEFAULT_FONT_TITLE = "Apple SD Gothic Neo" 
+DEFAULT_FONT_BODY = "AppleMyungjo"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# 5. 맞춤법 검사기 (py-hanspell)
+try:
+    from hanspell import spell_checker
+    HANSPELL_AVAILABLE = True
+except ImportError:
+    HANSPELL_AVAILABLE = False
+    print("⚠️ [System] py-hanspell 미설치. AI 교정만 수행합니다.")
+
+
+# ==============================================================================
+# [1] 도구 클래스 (TOOLKIT)
+# ==============================================================================
+
+class StyleReplicator:
+    """
+    [V33 Fixed] PDF 스타일 분석 및 '20줄 고정' 정밀 계산기
+    """
+    @staticmethod
+    def analyze_pdf(pdf_path):
+        try:
+            doc = fitz.open(pdf_path)
+            page = doc[0] # 첫 페이지만 분석하여 스타일 추출
+            blocks = page.get_text("dict")["blocks"]
+            font_sizes = []
+            
+            # 텍스트 블록에서 폰트 크기 수집
+            for b in blocks:
+                if "lines" in b:
+                    for l in b["lines"]:
+                        for s in l["spans"]:
+                            font_sizes.append(s["size"])
+            
+            if not font_sizes:
+                return None
+            
+            # 통계적 분석: 가장 많이 쓰인 크기(본문)와 가장 큰 크기(제목) 추출
+            body_size = Counter(font_sizes).most_common(1)[0][0]
+            title_size = max(font_sizes)
+            
+            # 여백 계산 (좌우 여백 추정)
+            rect = page.rect
+            margin_x = 72 # 기본값 (1인치)
+            if blocks:
+                left_x = blocks[0]["bbox"][0]
+                right_x = blocks[0]["bbox"][2]
+                margin_x = (rect.width - (right_x - left_x)) / 2
+            
+            # ★ [V33 핵심] 20줄 맞춤형 행간(Leading) 역산 로직 (A4 기준)
+            # A4 높이: 약 842pt (297mm)
+            # 상하 여백(Typography Standard): 위 3cm(85pt) + 아래 3cm(85pt) = 170pt
+            
+            vertical_margin_pt = 85.0 # 약 3cm
+            available_height = rect.height - (vertical_margin_pt * 2)
+            target_lines = 20
+            
+            line_height = available_height / target_lines
+            # 필요한 행간 (Leading) = 한 줄당 높이 - 폰트 크기
+            calculated_leading = line_height - body_size
+            
+            # 계산된 값이 너무 작거나 크면 안전값(18pt~24pt)으로 보정
+            if calculated_leading < 12: calculated_leading = 18.0
+            if calculated_leading > 40: calculated_leading = 24.0
+            
+            return {
+                "page_width": f"{rect.width}pt", 
+                "page_height": f"{rect.height}pt",
+                "margin_x": f"{margin_x}pt",
+                "margin_y": f"{vertical_margin_pt}pt",
+                "body_size": f"{body_size:.1f}pt", 
+                "title_size": f"{title_size:.1f}pt",
+                "text_size": f"{body_size}",
+                "leading": f"{calculated_leading:.2f}pt" # 계산된 행간
+            }
+        except Exception as e:
+            return None
+
+class TermGuard:
+    """
+    금칙어, 오타, AI 환각(Hallucination) 태그를 청소하는 경비원 클래스입니다.
+    """
+    @staticmethod
+    def enforce(text: str) -> str:
+        # 강제 교정 사전
+        replacements = {
+            "노가": "노아", 
+            "세신자": "새신자", 
+            "기를 축복합니다": "주님의 이름으로 축복합니다",
+            "###": "", 
+            "**": "",
+            # ★ [수정됨] eot_id 등 AI 내부 태그 완벽 제거
+            "|eot_id|": "", 
+            "<|eot_id|>": "", 
+            "eot_id": ""
+        }
+        
+        for k, v in replacements.items():
+            text = text.replace(k, v)
+            
+        # 특수문자 및 불필요한 공백 정리
+        text = text.replace("<", "").replace(">", "")
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text
+
+    @staticmethod
+    def run_spell_check(text: str) -> str:
+        """Hanspell 맞춤법 검사기 실행"""
+        if not HANSPELL_AVAILABLE: 
+            return text
+        try:
+            corrected = ""
+            # 문단별로 나누어 검사 (API 제한 고려)
+            for line in text.split('\n'):
+                if not line.strip(): 
+                    corrected += "\n"
+                elif len(line) < 500: 
+                    corrected += spell_checker.check(line).checked + "\n"
+                else: 
+                    corrected += line + "\n"
+            return corrected.strip()
+        except: 
+            return text
+
+class TextManager:
+    """
+    긴 텍스트를 AI가 처리하기 좋은 크기로 자르는 관리자입니다.
+    """
+    @staticmethod
+    def split_text_clean(text, chunk_size=3000):
+        chunks = []
+        start = 0
+        text_len = len(text)
+        
+        while start < text_len:
+            end = min(start + chunk_size, text_len)
+            
+            # 문장 중간에서 잘리지 않도록 마침표(.) 위치 확인
+            if end < text_len:
+                last_period = text.rfind('.', start, end)
+                if last_period != -1 and last_period > start + (chunk_size // 2): 
+                    end = last_period + 1
+            
+            chunk = text[start:end].strip()
+            if chunk: 
+                chunks.append(chunk)
+            start = end
+            
+        return chunks
+
+class KnowledgeManager:
+    """
+    Vector DB 검색 및 폰트/템플릿 파일을 관리하는 사서 클래스입니다.
+    """
+    @staticmethod
+    def scan_fonts(font_dir):
+        """폰트 폴더를 스캔하여 사용 가능한 폰트 목록을 만듭니다."""
+        found = []
+        if os.path.exists(font_dir):
+            for root, _, files in os.walk(font_dir):
+                for file in files:
+                    if file.lower().endswith(('.ttf', '.otf')):
+                        name = os.path.splitext(file)[0]
+                        # 폰트 이름 정규화 (Bold, Regular 등 제거)
+                        name = re.sub(r"-(Bold|Regular|Light|Medium|Black|Thin|ExtraBold|SemiBold)", "", name, flags=re.IGNORECASE)
+                        name = re.sub(r"([a-z])([A-Z])", r"\1 \2", name) 
+                        
+                        if "Noto Sans" in name: name = "Noto Sans KR"
+                        if "Noto Serif" in name: name = "Noto Serif KR"
+                        
+                        name = name.strip()
+                        if name not in found: found.append(name)
+                        
+        return found if found else [DEFAULT_FONT_TITLE, DEFAULT_FONT_BODY]
+
+    @staticmethod
+    def load_templates():
+        """디자인 템플릿(Typst 코드)을 로드합니다."""
+        buf = ""
+        if os.path.exists(DIR_TEMPLATE):
+            for file in glob.glob(os.path.join(DIR_TEMPLATE, "*.typ")):
+                try: 
+                    with open(file, 'r', encoding='utf-8') as f:
+                        buf += f"\n[Template Code: {os.path.basename(file)}]\n{f.read()}\n"
+                except: pass
+        return buf
+
+    @staticmethod
+    def search_vector_db(query: str, k: int = 5) -> str:
+        """RAG: Vector DB에서 관련 지식을 검색합니다."""
+        if not os.path.exists(DB_PERSIST_DIR):
+            log("Librarian", "⚠️ Vector DB가 없습니다. (지식 검색 건너뜀)")
+            return ""
+
+        log("Librarian", f"🔍 지식 검색 실행: '{query[:30]}...'")
+        try:
+            embeddings = HuggingFaceEmbeddings(
+                model_name=EMBEDDING_MODEL_ID,
+                model_kwargs={'device': 'mps'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+            vectordb = Chroma(
+                persist_directory=DB_PERSIST_DIR, 
+                embedding_function=embeddings,
+                collection_name="genesis_knowledge"
+            )
+            docs = vectordb.similarity_search(query, k=k)
+            
+            context_text = ""
+            for i, doc in enumerate(docs):
+                # ★ [수정됨] 파일명 오염 방지를 위해 메타데이터 출처는 숨김 처리
+                context_text += f"\n[Reference {i+1}]\n{doc.page_content}\n"
+            
+            log("Librarian", f"✅ 관련 문서 {len(docs)}건 확보 완료.")
+            return context_text
+        except Exception as e:
+            log("Librarian", f"❌ 검색 중 오류 발생: {e}")
+            return ""
+
+    @staticmethod
+    def fix_typst_syntax(code: str) -> str:
+        """
+        [V16] Typst 코드의 문법 오류 및 불필요한 찌꺼기를 완벽하게 제거합니다.
+        """
+        cleaned_lines = []
+        for line in code.split('\n'):
+            stripped = line.strip()
+            # 마크다운 코드 블록 제거
+            if stripped.startswith("###") or stripped.startswith("##") or stripped.startswith("```"):
+                continue
+            cleaned_lines.append(line)
+        
+        code = "\n".join(cleaned_lines)
+
+        # 1. 구버전 문법(locate)을 신버전(#context)으로 교체
+        code = code.replace("locate(loc =>", "#context")
+        code = re.sub(r"#?locate\s*\(\s*\w+\s*=>", "#context", code)
+        
+        # 2. 괄호 중첩 에러 해결 (loc 변수 강제 삭제)
+        code = code.replace(", loc)", ")") 
+        code = code.replace(",loc)", ")")
+        
+        # 3. 나머지 문법 정리
+        code = code.replace(".at(loc)", ".get()")
+        code = code.replace("locate(heading)", "heading")
+        code = code.replace("indent: true,", "")
+        code = code.replace("indent: true", "")
+        
+        return code
+    
+def log(agent, msg):
+    """로그 출력 함수"""
+    icons = {"Director": "🎬", "Librarian": "📚", "Editor": "✍️", "Designer": "🎨", "System": "⚙️", "Replicator": "🧬", "Illustrator": "🖌️"}
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {icons.get(agent, '🤖')} [{agent}] {msg}")
+
+def cleanup_on_start():
+    """시작 시 폴더 정리 및 잔여 파일 처리"""
+    for d in [FACTORY_DIR, DIR_RESULT, DIR_REFERENCE, DIR_TEMPLATE]:
+        if not os.path.exists(d): os.makedirs(d)
+        
+    target = os.path.join(FACTORY_DIR, "pc_output.json")
+    if os.path.exists(target):
+        try:
+            timestamp = int(time.time())
+            os.rename(target, os.path.join(FACTORY_DIR, f"ignored_{timestamp}.json"))
+        except: pass
+
+# ==============================================================================
+# [2] 상태 관리 (State Management)
+# ==============================================================================
+class BookState(TypedDict):
+    user_instruction: str; 
+    raw_material: str;
+    knowledge_context: str; 
+    available_fonts: List[str]
+    book_title: str; 
+    text_chunks: List[str]
+    polished_chunks: List[Tuple[str, str]]
+    current_chunk_idx: int;
+    replicated_template_name: str; 
+    illustration_freq: int
+
+# ==============================================================================
+# [3] AI 에이전트 (AGENTS)
+# ==============================================================================
+
+def load_model_once():
+    """모델 로딩 (최초 1회)"""
+    try:
+        log("System", "Maverick(Llama-4) 엔진 예열 중...")
+        return load(MODEL_PATH)
+    except: return None, None
+
+def agent_librarian(model, tokenizer, state: BookState) -> BookState:
+    """
+    [사서] 지식 검색 및 폰트/템플릿 준비
+    """
+    log("Librarian", "지식 도서관 접속 중...")
+    state['available_fonts'] = KnowledgeManager.scan_fonts(DIR_FONTS)
+    tpl_context = KnowledgeManager.load_templates()
+    
+    # RAG 검색 수행
+    search_query = f"{state['user_instruction']} {state['raw_material'][:500]}"
+    retrieved_knowledge = KnowledgeManager.search_vector_db(search_query, k=6)
+    
+    state['knowledge_context'] = tpl_context + "\n" + retrieved_knowledge
+    return state
+
+def agent_replicator(model, tokenizer, state: BookState) -> BookState:
+    """
+    [복제자] V36: 지식저장소(D5_Fonts) 폰트 최우선 적용 & 20줄 그리드
+    """
+    state['replicated_template_name'] = ""
+    
+    # PDF 분석
+    pdf_files = glob.glob(os.path.join(DIR_REFERENCE, "*.pdf"))
+    if not pdf_files:
+        log("Replicator", "⚠️ 스타일 참고용 PDF가 없습니다. 기본값 사용.")
+        analysis = {"margin_x": "3cm", "margin_y": "3cm", "text_size": "10.5", "leading": "22pt"}
+    else:
+        target_pdf = random.choice(pdf_files)
+        log("Replicator", f"스타일 추출 대상: {os.path.basename(target_pdf)}")
+        analysis = StyleReplicator.analyze_pdf(target_pdf)
+        if not analysis:
+             analysis = {"margin_x": "3cm", "margin_y": "3cm", "text_size": "10.5", "leading": "22pt"}
+    
+    # ★ [V36 핵심 수정] 폰트 우선순위 변경
+    # 기존: (기본폰트, 사용자폰트) -> 기본폰트가 있으면 무조건 당첨됨
+    # 변경: (사용자폰트, 기본폰트) -> 사용자폰트를 먼저 시도함
+    
+    available = state['available_fonts']
+    
+    # 폰트 리스트가 비어있지 않으면
+    if available:
+        # 사용자 폰트를 맨 앞에 배치 (따옴표 처리)
+        formatted_fonts = [f'"{f}"' for f in available[:3]]
+        fonts_str = ", ".join(formatted_fonts)
+        # 사용자 폰트 뒤에 안전장치로 기본 폰트 추가
+        font_array_code = f'({fonts_str}, "{DEFAULT_FONT_BODY}")'
+        log("Replicator", f"🔤 폰트 우선순위 적용: {available[0]} (사용자 지정)")
+    else:
+        font_array_code = f'("{DEFAULT_FONT_BODY}")'
+        log("Replicator", "⚠️ 사용자 폰트 없음. 기본 폰트 사용.")
+    
+    typ_code = f"""
+    // [Genesis Layout Engine V36: Font Priority Fix]
+    #let grid-leading = {analysis['leading']}
+    #let standard-leading = 0.8em 
+    
+    #set page(
+      paper: "a4",
+      margin: (x: {analysis['margin_x']}, y: {analysis['margin_y']}),
+      numbering: "1"
+    )
+    
+    #set text(
+      font: {font_array_code}, // ★ 사용자 폰트가 1순위로 들어감
+      size: {analysis['text_size']}pt, 
+      lang: "ko"
+    )
+    
+    #set par(
+      justify: true, 
+      first-line-indent: 1em, 
+      leading: grid-leading 
+    )
+    
+    #let chapter_title(content) = {{
+      pagebreak(weak: true)
+      v(4em)
+      // 제목용 폰트도 사용자 폰트가 있으면 그것을 우선 사용
+      text(size: 20pt, weight: "bold")[#content] 
+      v(2em)
+    }}
+    """
+    
+    template_name = f"replicated_{int(time.time())}.typ"
+    with open(os.path.join(DIR_TEMPLATE, template_name), "w", encoding="utf-8") as f: 
+        f.write(typ_code)
+    state['replicated_template_name'] = template_name
+    log("Replicator", "✅ 스타일 템플릿 생성 완료.")
+    return state
+
+def agent_director(model, tokenizer, state: BookState) -> BookState:
+    """
+    [기획자] ★ V35: 맥락 이해 기반 제목 추출 (LLM Context Awareness)
+    """
+    if not state['raw_material']: return state
+    log("Director", "기획 및 전처리 중... (제목 맥락 분석 중)")
+    
+    instruction = state['user_instruction']
+    forced_title = ""
+
+    # 1. 1차 시도: 정규식 (빠른 검사)
+    patterns = [
+        r"^\s*(?:제목|Title|책\s*제목)\s*[:=：]\s*(.*?)$",
+        r"^\s*제목은\s*(.*?)\s*(?:야|이야|로\s*해줘|입니다|이다)$"
+    ]
+    for pat in patterns:
+        match = re.search(pat, instruction, re.MULTILINE | re.IGNORECASE)
+        if match:
+            forced_title = match.group(1).strip().strip('"\'.,')
+            forced_title = re.sub(r"(라고|으로)?\s*(해줘|지어줘|부탁해)$", "", forced_title).strip()
+            break
+    
+    # 2. ★ [V35 핵심] LLM에게 직접 물어보기 (Context Awareness)
+    # 정규식이 실패했다면, AI에게 지시사항을 읽고 제목을 찾아내라고 시킴
+    if not forced_title:
+        log("Director", "🕵️‍♂️ 제목 맥락 정밀 분석 중 (AI Reading)...")
+        prompt = f"""<|system|>You are a helpful assistant. Read the user's instruction and identify if a specific Book Title is requested.
+[User Instruction]:
+{instruction}
+
+[Task]:
+- If the user explicitly stated a title (e.g., "Title is X", "Make the title X", "제목: X"), output ONLY that title.
+- If the user did NOT specify a title, output exactly "NONE".
+
+[Examples]:
+- Input: "제목은 김모세로 해줘" -> Output: "김모세"
+- Input: "교정 잘 부탁해" -> Output: "NONE"
+<|user|>Extract Title<|assistant|>"""
+        
+        try:
+            # 50토큰 정도만 생성해서 짧게 답변 받음
+            extracted = generate(model, tokenizer, prompt=prompt, max_tokens=50, verbose=False).strip()
+            
+            # "NONE"이 아니고, 유의미한 내용이 있으면 그것을 제목으로 채택
+            if "NONE" not in extracted and len(extracted) > 1:
+                # 불필요한 따옴표 제거
+                forced_title = extracted.strip('"\' ')
+                log("Director", f"🧩 맥락 파악 완료: '{forced_title}'")
+        except: pass
+
+    # 3. 결과 적용 (사용자 지정 or AI 창작)
+    if forced_title:
+        state['book_title'] = forced_title
+        log("Director", f"🔒 사용자 제목 강제 적용: {state['book_title']}")
+    else:
+        # 진짜 없을 때만 창작
+        prompt = f"""<|system|>You are a Chief Editor. Determine the book title.
+[User Instruction]: "{state['user_instruction']}"
+[Content Preview]: {state['raw_material'][:2000]}
+[STRICT RULES]: Create a best-selling title. Output ONLY the final title text.
+<|user|>Determine Title<|assistant|>"""
+        
+        title_raw = generate(model, tokenizer, prompt=prompt, max_tokens=100, verbose=False).strip()
+        title_clean = title_raw.split("<|")[0]
+        title_clean = re.sub(r"^(Title|Subject|제목|책\s*제목|결과)\s*[:：]\s*", "", title_clean, flags=re.IGNORECASE)
+        state['book_title'] = title_clean.strip('"\' ')
+        log("Director", f"🧠 AI 기획 제목: {state['book_title']}")
+    
+    state['text_chunks'] = TextManager.split_text_clean(state['raw_material'])
+    return state
+
+def agent_hybrid_editor(model, tokenizer, state: BookState) -> BookState:
+    """
+    [편집자] 텍스트 윤문 및 교정
+    """
+    idx = state['current_chunk_idx']
+    if idx >= len(state['text_chunks']): return state
+    
+    current_text = state['text_chunks'][idx]
+    log("Editor", f"윤문 작업 중... [{idx+1}/{len(state['text_chunks'])}]")
+    
+    prev_text = ""
+    if state['polished_chunks']:
+        for t, c in reversed(state['polished_chunks']):
+            if t == 'text':
+                prev_text = c[-300:]
+                break
+    
+    prompt = f"""<|system|>수석 편집장입니다. 문맥 복원 및 윤문.
+[참고 지식]: {state['knowledge_context'][:2000]}
+[원칙] 문맥 복원, 문어체, 문단 구분.
+<|user|>[이전]:...{prev_text}\n[원문]:{current_text}\n[지시]:윤문하라.<|assistant|>"""
+    
+    draft = generate(model, tokenizer, prompt=prompt, max_tokens=4000, verbose=False)
+    
+    # ★ 태그 청소 및 사족 제거
+    draft = draft.split("<|")[0]
+    draft = re.sub(r"^(네|물론|알겠|확인|수정|윤문|제시|따라서).+?(\n|$)", "", draft, flags=re.MULTILINE).strip()
+    
+    # 맞춤법 검사
+    if HANSPELL_AVAILABLE: 
+        draft = TermGuard.run_spell_check(draft)
+    
+    # 최종 금칙어 교정
+    final_text = TermGuard.enforce(draft)
+    
+    state['polished_chunks'].append(('text', final_text))
+    state['current_chunk_idx'] += 1
+    return state
+
+def agent_illustrator(model, tokenizer, state: BookState) -> BookState:
+    """
+    ★ [V33 Upgrade] 토큰 제한(77 Limit) 해결 + 시네마틱 사진 + 안전장치
+    """
+    processed_count = len(state['polished_chunks'])
+    if not state['polished_chunks']: return state
+
+    last_type, last_content = state['polished_chunks'][-1]
+    freq = state.get('illustration_freq', DEFAULT_ILLUSTRATION_FREQ)
+
+    if last_type == 'text' and (processed_count % freq == 0):
+        log("Illustrator", f"📷 설교 묵상 및 키워드 최적화 프롬프트 작성 (빈도: {freq})...")
+        
+        # 키워드 중심(Keyword-only) 프롬프트 생성 (77토큰 제한 해결)
+        prompt_desc = f"""<|system|>You are a Master Photographer specializing in Cinematic Biblical Realism.
+Your task is to create a prompt for a hyper-realistic photograph.
+
+[Input Sermon Text]:
+{last_content[:700]}
+
+[CRITICAL RULES]:
+1. **NO SENTENCES.** Do not use "A photo of...", "The scene shows...", "In the background...".
+2. **USE KEYWORDS ONLY.** Separate with commas. Focus on visual objects.
+3. **KEEP IT SHORT.** Maximum 50 words to avoid truncation errors.
+
+[Examples]:
+- Bad: "A beautiful image showing a seed growing in the ground representing faith." (Too long)
+- Good: "close-up shot, hand planting gold coin, fertile soil, sunrise lighting, cinematic, 8k, sharp focus"
+
+<|user|>Create Keyword Prompt<|assistant|>"""
+        
+        try:
+            # max_tokens를 줄여서 AI가 길게 말하는 것을 원천 차단
+            visual_prompt = generate(model, tokenizer, prompt=prompt_desc, max_tokens=100, verbose=False).strip()
+        except: visual_prompt = "Error"
+
+        # 한글/오류 방어 로직 (키워드 형태로 변경됨)
+        if re.search(r'[가-힣]', visual_prompt) or len(visual_prompt) < 10 or "Error" in visual_prompt:
+            visual_prompt = "sacred biblical scene, divine light, grace, hyper-realistic, 8k resolution, dramatic lighting, sharp focus, solemn atmosphere"
+        
+        # 잡다한 설명 제거
+        visual_prompt = re.sub(r'^(Here is|Prompt:|Visual Metaphor:|Keywords:).*?[\:\n]', '', visual_prompt).strip()
+        
+        # ★ [핵심 수정] 스타일 태그 전진 배치 (Front-Loading)
+        final_prompt = f"photorealistic, 8k uhd, cinematic lighting, {visual_prompt}, highly detailed, sharp focus, masterpiece, sacred art"
+        
+        log("Illustrator", f"의뢰서(토큰 최적화): {final_prompt[:60]}...")
+
+        try:
+            # ★ [필수 안전장치 2] 타임아웃 180초 (PC가 VRAM 정리하느라 느릴 때를 대비)
+            res = requests.post(PC_FLUX_SERVER_URL, json={"prompt": final_prompt}, timeout=180)
+            if res.status_code == 200:
+                fname = res.json().get("filename")
+                if fname:
+                    log("Illustrator", f"✅ 사진 도착: {fname}")
+                    state['polished_chunks'].append(('image', fname))
+            else: 
+                log("Illustrator", f"⚠️ 서버 오류: {res.status_code}")
+        except requests.exceptions.Timeout:
+            log("Illustrator", "⏰ 시간 초과 (PC가 바쁨, 사진 생략)")
+        except Exception as e: 
+            log("Illustrator", f"❌ 연결 실패: {e}")
+            
+    return state
+
+def agent_designer(model, tokenizer, state: BookState) -> bool:
+    """
+    [디자이너] V33: 다이내믹 레이아웃 (이미지 스코프 적용) & 폰트명 안전 처리
+    """
+    log("Designer", "📚 최종 조판 작업 시작 (다이내믹 레이아웃 적용).")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_file = os.path.join(DIR_RESULT, f"GenesisBook_{timestamp}")
+    
+    state['available_fonts'] = KnowledgeManager.scan_fonts(DIR_FONTS)
+    
+    style_code = ""
+    if state.get('replicated_template_name'):
+        try:
+            tpl_path = os.path.join(DIR_TEMPLATE, state['replicated_template_name'])
+            with open(tpl_path, 'r', encoding='utf-8') as f:
+                style_code = f.read()
+        except: pass
+
+    content_code = ""
+    for c_type, content in state['polished_chunks']:
+        if c_type == 'text':
+            clean = content.replace("#", "").replace("*", "").replace("`", "") 
+            clean = clean.replace("[", "\\[").replace("]", "\\]")
+            content_code += f"{clean}\n\n"
+        elif c_type == 'image':
+            if os.path.exists(os.path.join(FACTORY_DIR, content)):
+                # ★ 이미지 삽입 구간 스코프 처리 (V27/V33)
+                content_code += f"""
+                #[
+                  #set par(leading: standard-leading)
+                  #v(1em)
+                  #figure(
+                    image("../{content}", width: 85%),
+                    caption: [영적 시각화]
+                  )
+                  #v(1em)
+                ]
+                \n
+                """
+
+    full_typst = f"""
+    {style_code}
+    
+    // 도비라(속표지)
+    #align(center + horizon)[
+      // ★ 폰트명 에러 해결 (변수 사용)
+      #text(size: 24pt, weight: "bold", font: "{DEFAULT_FONT_TITLE}")[{state['book_title']}]
+      #v(2em)
+      #text(size: 12pt)[GENESIS AI WRITER]
+    ]
+    
+    // 챕터 제목 적용
+    #chapter_title[{state['book_title']}]
+    
+    {content_code}
+    """
+    
+    with open(f"{out_file}.typ", "w", encoding="utf-8") as f: f.write(full_typst)
+    try:
+        subprocess.run(["typst", "compile", f"{out_file}.typ", f"{out_file}.pdf", "--root", FACTORY_DIR, "--font-path", DIR_FONTS], check=True)
+        log("Designer", f"🎉 책 완성: {os.path.basename(out_file)}.pdf")
+        return True
+    except Exception as e:
+        log("Designer", f"❌ 컴파일 실패: {e}")
+        return False
+
+# ==============================================================================
+# [5] 메인 루프 (V18: PHANTOM SIGNAL FIX & TEXT CHECK)
+# ==============================================================================
+def run_genesis_architect(model, tokenizer, json_path):
+    """
+    단일 작업을 처리하는 핵심 함수
+    """
+    with open(json_path, 'r', encoding='utf-8') as f:
+        input_json = json.load(f)
+
+    custom_freq = DEFAULT_ILLUSTRATION_FREQ
+    if "frequency" in input_json:
+        try: custom_freq = int(input_json["frequency"])
+        except: pass
+
+    # 에러 보고 파일은 무시
+    if input_json.get("status") == "error":
+        log("System", f"🛑 오류 보고 무시: {input_json.get('message')}")
+        return False
+
+    # 1. 텍스트 파일 로딩 로직
+    raw_text = input_json.get("script_ko", "") or input_json.get("script", "")
+    text_filename = input_json.get("text_file", "")
+    
+    # 텍스트 파일이 명시된 경우 읽기 시도
+    if not raw_text and text_filename:
+        txt_path = os.path.join(FACTORY_DIR, text_filename)
+        # 파일이 전송될 때까지 잠시 대기 (최대 5초)
+        for _ in range(5): 
+            if os.path.exists(txt_path): break
+            time.sleep(1)
+            
+        if os.path.exists(txt_path):
+            log("System", f"📂 텍스트 파일 로드 성공: {text_filename}")
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                raw_text = f.read()
+        else:
+            log("System", f"⚠️ 텍스트 파일을 찾을 수 없음: {text_filename}")
+            return False 
+
+    # ★ 2. 텍스트가 없으면 즉시 종료 (False 반환) -> 메인 루프에서 무시 처리됨
+    if not raw_text:
+        return False
+
+    # 3. 상태 초기화
+    state: BookState = {
+        "user_instruction": input_json.get("script", ""), 
+        "raw_material": raw_text,  
+        "img_snap": input_json.get("image_source", ""),
+        "img_flux": input_json.get("flux_source", ""),
+        "learned_style": "", "knowledge_context": "", "available_fonts": [],
+        "book_title": "", "text_chunks": [], "polished_chunks": [],
+        "current_chunk_idx": 0, "layout_config": {}, 
+        "replicated_template_name": "", "selected_style_name": "",
+        "illustration_freq": custom_freq
+    }
+    
+    # 에이전트 순차 실행
+    state = agent_librarian(model, tokenizer, state) 
+    state = agent_replicator(model, tokenizer, state)
+    state = agent_director(model, tokenizer, state)
+    
+    total = len(state['text_chunks'])
+    while state['current_chunk_idx'] < total:
+        state = agent_hybrid_editor(model, tokenizer, state)
+        state = agent_illustrator(model, tokenizer, state)
+    
+    return agent_designer(model, tokenizer, state)
+
+def main():
+    """
+    프로그램 진입점: 파일 감시 및 작업 스케줄링
+    """
+    print("\n" + "="*80)
+    print(" 🏛️  [GENESIS WRITER V34: ALL FEATURES RESTORED]")
+    print(f"     Monitoring: {FACTORY_DIR}")
+    print("     Status: 🟢 Waiting for TEXT content...")
+    print("="*80)
+    
+    model, tokenizer = load_model_once()
+    if not model: return
+    cleanup_on_start()
+    
+    while True:
+        try:
+            files = os.listdir(FACTORY_DIR)
+            
+            # 오직 pc_output.json만 처리
+            if "pc_output.json" in files:
+                target_path = os.path.join(FACTORY_DIR, "pc_output.json")
+                processing_path = os.path.join(FACTORY_DIR, "processing.json")
+                
+                try:
+                    # 1. 파일 선점 (이름 변경)
+                    os.rename(target_path, processing_path)
+                    
+                    # 2. 내용 확인 (텍스트 없으면 무시)
+                    with open(processing_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    # 텍스트 존재 여부 확인 필터
+                    has_text = data.get("script_ko") or data.get("script") or data.get("text_file")
+                    
+                    if not has_text:
+                        # 텍스트 없는 신호는 조용히 무시 (로그 안 남김)
+                        ignored_name = f"ignored_signal_{int(time.time())}.json"
+                        os.rename(processing_path, os.path.join(FACTORY_DIR, ignored_name))
+                        continue
+
+                    # 3. 진짜 작업 시작
+                    log("System", "🚀 원고 발견! 집필 시작...")
+                    success = run_genesis_architect(model, tokenizer, processing_path)
+                    
+                    if success:
+                        final_name = f"done_{int(time.time())}.json"
+                        os.rename(processing_path, os.path.join(FACTORY_DIR, final_name))
+                        log("System", "✅ 작업 완료. 대기 모드 전환.")
+                    else:
+                        error_name = f"error_{int(time.time())}.json"
+                        os.rename(processing_path, os.path.join(FACTORY_DIR, error_name))
+                        log("System", "❌ 작업 실패 (에러 파일 보관).")
+                        
+                except OSError: pass
+                except Exception as e:
+                    log("System", f"⚠️ 오류: {e}")
+
+        except Exception: pass
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
